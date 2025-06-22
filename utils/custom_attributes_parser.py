@@ -1,43 +1,75 @@
-# /etl/custom_attributes.py
+import psycopg2
+import uuid
 
-from sqlalchemy import create_engine, text
-import re
-
-# Пример подключения — замени на свои значения
-DATABASE_URL = "postgresql+psycopg2://username:password@localhost:5432/dbname"
+def get_custom_attributes_rows(db_config):
+    """Чтение всех строк из custom_attributes_raw"""
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+    cur.execute("SELECT id, custom_attributes_raw FROM custom_attributes_raw")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 def parse_custom_attributes(raw_string):
-    """Парсит строку атрибутов в словарь"""
-    pairs = raw_string.strip().split('-')
-    attributes = {}
-    for pair in pairs:
+    """Парсинг строки 'ключ:значение-ключ2:знач2' в dict"""
+    if not raw_string:
+        return {}
+    result = {}
+    for pair in raw_string.split('-'):
         if ':' in pair:
             key, value = pair.split(':', 1)
-            attributes[key.strip()] = value.strip()
-    return attributes
+            result[key.strip()] = value.strip()
+    return result
 
-def extract_all_raw_attributes():
-    """Извлекает строки из таблицы custom_attributes_raw"""
-    engine = create_engine(DATABASE_URL)
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT id, custom_attributes_raw FROM custom_attributes_raw"))
-        return result.fetchall()
+def insert_parsed_attributes(db_config, raw_id, attributes):
+    """Вставляет каждую пару в custom_attributes_parsed"""
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+    ids = []
+    for k, v in attributes.items():
+        parsed_id = str(uuid.uuid4())
+        cur.execute(
+            """
+            INSERT INTO custom_attributes_parsed (id, raw_id, attr_key, attr_value)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (parsed_id, raw_id, k, v)
+        )
+        ids.append(cur.fetchone()[0])
+    conn.commit()
+    cur.close()
+    conn.close()
+    return ids
 
-def insert_into_target_table(data):
-    """Сохраняет разобранные данные в новую таблицу (например, custom_attributes_parsed)"""
-    engine = create_engine(DATABASE_URL)
-    with engine.begin() as conn:
-        for row_id, raw_text in data:
-            parsed = parse_custom_attributes(raw_text)
-            for key, value in parsed.items():
-                conn.execute(
-                    text("""
-                        INSERT INTO custom_attributes_parsed (raw_id, attr_key, attr_value)
-                        VALUES (:raw_id, :attr_key, :attr_value)
-                    """),
-                    {"raw_id": row_id, "attr_key": key, "attr_value": value}
-                )
-
-def run():
-    raw_data = extract_all_raw_attributes()
-    insert_into_target_table(raw_data)
+def link_with_product_collections(db_config, raw_id, parsed_ids):
+    """
+    Связывает custom_attributes_parsed с product_collection через product_collection_custom_attributes_raw и product_collection_custom_attributes_parsed
+    """
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+    # Находим все коллекции, связанные с этим raw_id
+    cur.execute(
+        """
+        SELECT product_collection_id FROM product_collection_custom_attributes_raw
+        WHERE custom_attributes_raw_id = %s
+        """,
+        (raw_id,)
+    )
+    rows = cur.fetchall()
+    product_collection_ids = [r[0] for r in rows]
+    for collection_id in product_collection_ids:
+        for parsed_id in parsed_ids:
+            link_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO product_collection_custom_attributes_parsed (id, product_collection_id, custom_attributes_parsed_id)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (link_id, collection_id, parsed_id)
+            )
+    conn.commit()
+    cur.close()
+    conn.close()
