@@ -27,7 +27,7 @@ DB_CONFIG = {
 }
 
 # File paths - can be overridden by environment variables
-RAW_CSV_PATH = os.getenv('RAW_CSV_PATH', 'x:\\DATA_STORAGE\\Furnithai\\RAW_WXW\\__Raw Data.csv')
+RAW_CSV_PATH = os.getenv('RAW_CSV_PATH', 'x:\\DATA_STORAGE\\Furnithai\\RAW_WXW\\latest_Raw Data.csv')
 MAPPING_CSV_PATH = os.getenv('MAPPING_CSV_PATH', 'x:\\DATA_STORAGE\\Furnithai\\utils\\importer\\map.csv')
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
