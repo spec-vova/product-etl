@@ -7,3 +7,10 @@ data_tables/
 .idea/
 .vscode/
 .keys/
+*.csv
+*.pdf
+*.html
+*.jpg
+*.xlsx
+*.png
+import_log.txt
