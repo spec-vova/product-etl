@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import csv
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -25,17 +24,32 @@ DB_PASS = os.getenv('DB_PASS')
 
 IMAGES_FOLDER = Path(r"X:\DATA_STORAGE\Furnithai\pictures")
 LOG_FILE = IMAGES_FOLDER / 'import_log.txt'
-PROGRESS_CSV = IMAGES_FOLDER / 'import_progress.csv'
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def parse_img_array(img_array):
     if isinstance(img_array, list):
-        return img_array
+        # Фильтруем только URL из массива, игнорируя числовые параметры
+        urls = []
+        for item in img_array:
+            item_str = str(item).strip()
+            # Очищаем от лишних символов в начале
+            item_str = item_str.lstrip('["')
+            # Проверяем, что это URL (начинается с http/https)
+            if item_str.startswith(('http://', 'https://')):
+                urls.append(item_str)
+        return urls
     if not img_array:
         return []
     s = img_array.strip('{}').replace('"', '')
-    return [u.strip() for u in s.split(',') if u.strip()]
+    items = [u.strip() for u in s.split(',') if u.strip()]
+    # Фильтруем только URL из строкового массива
+    urls = []
+    for item in items:
+        item = item.lstrip('["')
+        if item.startswith(('http://', 'https://')):
+            urls.append(item)
+    return urls
 
 
 def download_image(url, save_path):
@@ -46,6 +60,10 @@ def download_image(url, save_path):
         with open(save_path, 'wb') as f:
             f.write(r.content)
         return True, None
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            return False, '404 Not Found'
+        return False, str(e)
     except Exception as e:
         return False, str(e)
 
@@ -56,41 +74,11 @@ def log(msg):
         f.write(msg + '\n')
 
 
-def load_progress():
-    seen = set()
-    if PROGRESS_CSV.exists():
-        with open(PROGRESS_CSV, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['status'] == 'success':
-                    seen.add((row['collection_sku'], row['url']))
-    else:
-        # write header
-        with open(PROGRESS_CSV, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['collection_sku','url','local_path','status','error'])
-    return seen
 
 
-def append_progress(collection_sku, url, local_path, status, error=''):
-    with open(PROGRESS_CSV, 'a', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([collection_sku, url, str(local_path), status, error])
 
-
-def main():
-    IMAGES_FOLDER.mkdir(parents=True, exist_ok=True)
-    if LOG_FILE.exists():
-        LOG_FILE.unlink()
-
-    seen = load_progress()
-
-    conn = psycopg2.connect(
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-        host=DB_HOST, port=DB_PORT
-    )
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-
+def get_collections_without_images(cursor):
+    """Получить коллекции, у которых нет обработанных изображений в БД"""
     cursor.execute("""
         SELECT
             pc.product_collection_sku       AS collection_sku,
@@ -100,9 +88,38 @@ def main():
         JOIN product_collection_product_collection_img_array link_tbl
             ON link_tbl.product_collection_id = pc.id
         JOIN product_collection_img_array img_tbl
-            ON img_tbl.id = link_tbl.product_collection_img_array;
+            ON img_tbl.id = link_tbl.product_collection_img_array
+        LEFT JOIN product_collection_images pci
+            ON pci.collection_sku = pc.product_collection_sku
+        WHERE pci.collection_sku IS NULL;
     """)
-    rows = cursor.fetchall()
+    return cursor.fetchall()
+
+
+def get_processed_urls_from_db(cursor, collection_sku):
+    """Получить уже обработанные URL для конкретной коллекции из БД"""
+    cursor.execute("""
+        SELECT url_original
+        FROM product_collection_images
+        WHERE collection_sku = %s;
+    """, (collection_sku,))
+    return {row['url_original'] for row in cursor.fetchall()}
+
+
+def main():
+    IMAGES_FOLDER.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists():
+        LOG_FILE.unlink()
+
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+        host=DB_HOST, port=DB_PORT
+    )
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+    # Получаем только коллекции без обработанных изображений
+    rows = get_collections_without_images(cursor)
+    log(f"Найдено {len(rows)} коллекций без обработанных изображений.")
 
     for row in tqdm(rows, desc='Collections'):
         collection_sku = row['collection_sku']
@@ -112,11 +129,13 @@ def main():
             log(f"[{collection_sku}] Нет фотографий.")
             continue
 
+        # Получаем уже обработанные URL для этой коллекции из БД
+        processed_urls = get_processed_urls_from_db(cursor, collection_sku)
+        
         local_paths = []
         for idx, url in enumerate(urls, start=1):
-            if (collection_sku, url) in seen:
-                log(f"[{collection_sku}] [SKIP] Уже загружено URL: {url}")
-                continue
+            if url in processed_urls:
+                continue  # Пропускаем без логирования
 
             ext = os.path.splitext(url)[1].split('?')[0] or '.jpg'
             filename = f"{collection_sku}_{idx}{ext}"
@@ -125,23 +144,26 @@ def main():
             ok, err = download_image(url, save_path)
             if ok:
                 log(f"[{collection_sku}] [{filename}] Загружено.")
-                append_progress(collection_sku, url, save_path, 'success')
+                # Записываем в БД только при успешной загрузке
+                cursor.execute(
+                    """
+                    INSERT INTO product_collection_images
+                        (collection_sku, collection_master_code, image_index, url_original, url_local)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                    """,
+                    (collection_sku, master_code, idx, url, str(save_path))
+                )
+                local_paths.append(str(save_path))
             else:
-                log(f"[{collection_sku}] [{filename}] Ошибка: {err}")
-                append_progress(collection_sku, url, save_path, 'failed', err)
-            time.sleep(1)
+                if err == '404 Not Found':
+                    log(f"[{collection_sku}] [{filename}] Ошибка 404: Файл не найден по URL: {url}")
+                else:
+                    log(f"[{collection_sku}] [{filename}] Ошибка загрузки: {err}")
+            
+            time.sleep(0.5) # Снижаем задержку
 
-            # записать в БД
-            cursor.execute(
-                """
-                INSERT INTO product_collection_images
-                    (collection_sku, collection_master_code, image_index, url_original, url_local)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING;
-                """,
-                (collection_sku, master_code, idx, url, str(save_path))
-            )
-            local_paths.append(str(save_path))
+
 
         # обновить массив локальных путей в коллекции
         if local_paths:

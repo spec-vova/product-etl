@@ -10,7 +10,7 @@ load_dotenv()
 
 DB_CONFIG = {
     "host": "localhost",
-    "port": os.getenv("DB_PORT", "5432"),
+    "port": os.getenv("DB_PORT", "5433"),
     "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASS")
@@ -20,7 +20,13 @@ def get_all_products():
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, product_attributes_raw_collection_id FROM product WHERE product_attributes_raw_collection_id IS NOT NULL
+        SELECT p.id, p.product_attributes_raw_collection_id 
+        FROM product p 
+        WHERE p.product_attributes_raw_collection_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM product_attribute_product pap 
+            WHERE pap.product_id = p.id
+        )
     """)
     rows = cur.fetchall()
     cur.close()
@@ -128,9 +134,9 @@ def main():
     target_lang = 'en'    # целевой язык перевода
     conn = psycopg2.connect(**DB_CONFIG)
 
-    # 1. Парсим продукты и строим уникальный справочник
+    # 1. Парсим только продукты без атрибутов и строим уникальный справочник
     products = get_all_products()
-    print(f"Found {len(products)} products.")
+    print(f"Found {len(products)} products without attributes.")
     for product_id, collection_id in products:
         attr_str = get_collection_attrs(collection_id)
         if not attr_str:
